@@ -123,10 +123,15 @@ async function getTodayMatches() {
 
 // Trận đang live
 async function getLiveMatches() {
-  const data = await fdGet(`/competitions/${WC_CODE}/matches`, {
-    season: WC_SEASON, status: 'IN_PLAY,PAUSED,HALF_TIME'
-  });
-  return data.matches || [];
+  const statuses = ['IN_PLAY', 'PAUSED', 'HALF_TIME'];
+  const results = await Promise.allSettled(
+    statuses.map(s => fdGet(`/competitions/${WC_CODE}/matches`, {
+      season: WC_SEASON, status: s
+    }))
+  );
+  return results
+    .filter(r => r.status === 'fulfilled')
+    .flatMap(r => r.value.matches || []);
 }
 
 // Trận sắp diễn ra (giờ tới)
