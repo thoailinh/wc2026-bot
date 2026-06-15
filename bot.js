@@ -134,13 +134,16 @@ async function getTodayMatches() {
 }
 
 // Trận đang live
-// Trước đây bắn 3 request riêng (IN_PLAY/PAUSED/HALF_TIME) → gộp thành 1
-// request bằng status dạng comma-separated (football-data.org hỗ trợ,
-// giống cách getUpcoming() đang dùng 'SCHEDULED,TIMED'). Giúp tiết kiệm
-// quota 10 req/phút của free tier để có thể poll thường xuyên hơn.
+// FIX: 'HALF_TIME' KHÔNG phải là giá trị status hợp lệ trong football-data.org
+// API v4 (enum chỉ gồm SCHEDULED, IN_PLAY, PAUSED, FINISHED, SUSPENDED,
+// POSTPONED, CANCELLED, AWARDED) → gửi 'IN_PLAY,PAUSED,HALF_TIME' khiến API
+// trả 400 Bad Request, làm /live luôn báo lỗi. v4 đã hỗ trợ sẵn pseudo-status
+// 'LIVE' mà backend tự hiểu là IN_PLAY + PAUSED (đã bao gồm cả half-time, vì
+// half-time ở v4 được biểu diễn bằng status PAUSED) → dùng trực tiếp giá trị
+// này, gọn và đúng chuẩn hơn.
 async function getLiveMatches() {
   const data = await fdGet(`/competitions/${WC_CODE}/matches`, {
-    season: WC_SEASON, status: 'IN_PLAY,PAUSED,HALF_TIME'
+    season: WC_SEASON, status: 'LIVE'
   });
   return data.matches || [];
 }
@@ -279,7 +282,8 @@ function fmtLive(m) {
   const ag     = m.score?.fullTime?.away ?? m.score?.halfTime?.away ?? 0;
   const min    = m.minute || '?';
   const status = m.status || 'LIVE';
-  const label  = status === 'HALF_TIME' ? '⏸ HT' : status === 'PAUSED' ? '⏸ PAUSED' : `⏱ ${min}'`;
+  // v4 không có status 'HALF_TIME' riêng — hết hiệp 1 cũng trả về 'PAUSED'.
+  const label  = status === 'PAUSED' ? '⏸ Hết hiệp/Tạm dừng' : `⏱ ${min}'`;
   return `🔴 <b>LIVE</b>  ${flag(home)} ${home} <b>${hg}–${ag}</b> ${away} ${flag(away)}  ${label}`;
 }
 
