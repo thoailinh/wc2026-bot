@@ -181,6 +181,115 @@ function fmtLive(m) {
   return `🔴 <b>LIVE</b>  ${flag(home)} ${home} <b>${hg}–${ag}</b> ${away} ${flag(away)}  ${label}`;
 }
 
+// ─── DỰ ĐOÁN TỈ SỐ (Poisson model) ──────────────────────────────────────────
+// Ý tưởng: dựa trên số bàn thắng/bại trung bình mỗi trận của từng đội tại
+// WC2026 (đã đấu) so với trung bình toàn giải, suy ra "sức tấn công" và
+// "sức phòng ngự" tương đối. Từ đó tính λ (số bàn kỳ vọng) cho mỗi đội rồi
+// dùng phân phối Poisson để tìm tỉ số có xác suất cao nhất + % thắng/hòa/thua.
+
+let teamStatsCache = { data: null, ts: 0 };
+const STATS_TTL_MS = 30 * 60 * 1000; // cache 30 phút
+
+// Gom thống kê (số trận, bàn ghi được, bàn thua) cho từng đội từ các trận đã
+// kết thúc (FINISHED) tại WC2026.
+async function getTeamStats() {
+  const now = Date.now();
+  if (teamStatsCache.data && now - teamStatsCache.ts < STATS_TTL_MS) return teamStatsCache.data;
+
+  const data    = await fdGet(`/competitions/${WC_CODE}/matches`, { season: WC_SEASON, status: 'FINISHED' });
+  const matches = data.matches || [];
+  const stats   = {}; // teamId -> { played, scored, conceded }
+  const ensure  = id => stats[id] || (stats[id] = { played: 0, scored: 0, conceded: 0 });
+
+  for (const m of matches) {
+    const hg = m.score?.fullTime?.home;
+    const ag = m.score?.fullTime?.away;
+    if (hg === null || hg === undefined || ag === null || ag === undefined) continue;
+    const h = ensure(m.homeTeam.id);
+    const a = ensure(m.awayTeam.id);
+    h.played++; h.scored += hg; h.conceded += ag;
+    a.played++; a.scored += ag; a.conceded += hg;
+  }
+
+  teamStatsCache = { data: stats, ts: now };
+  return stats;
+}
+
+// Trung bình bàn/trận của toàn giải tính tới hiện tại (dùng làm baseline)
+function leagueAvgGoals(stats) {
+  let played = 0, goals = 0;
+  for (const s of Object.values(stats)) { played += s.played; goals += s.scored; }
+  // Nếu giải chưa có trận nào kết thúc → dùng mức trung bình World Cup lịch sử (~1.35 bàn/đội/trận)
+  return played > 0 ? goals / played : 1.35;
+}
+
+function factorial(n) { let r = 1; for (let i = 2; i <= n; i++) r *= i; return r; }
+function poissonP(lambda, k) { return Math.exp(-lambda) * Math.pow(lambda, k) / factorial(k); }
+
+// Dự đoán cho 1 trận: trả về tỉ số khả năng cao nhất + % thắng/hòa/thua
+async function predictMatch(m) {
+  const stats     = await getTeamStats();
+  const leagueAvg = leagueAvgGoals(stats);
+
+  const hs = stats[m.homeTeam?.id] || { played: 0, scored: 0, conceded: 0 };
+  const as = stats[m.awayTeam?.id] || { played: 0, scored: 0, conceded: 0 };
+
+  // Hệ số tấn công / phòng ngự so với trung bình giải (1 = trung bình)
+  const hAttack  = hs.played ? (hs.scored   / hs.played) / leagueAvg : 1;
+  const hDefense = hs.played ? (hs.conceded / hs.played) / leagueAvg : 1;
+  const aAttack  = as.played ? (as.scored   / as.played) / leagueAvg : 1;
+  const aDefense = as.played ? (as.conceded / as.played) / leagueAvg : 1;
+
+  const HOME_ADV = 1.1; // lợi thế sân nhà ~10% (áp dụng luôn cho sân trung lập như ước lượng đơn giản)
+
+  let lambdaHome = leagueAvg * hAttack * aDefense * HOME_ADV;
+  let lambdaAway = leagueAvg * aAttack * hDefense;
+
+  // Chặn biên tránh λ quá lớn/nhỏ khi mẫu dữ liệu còn ít
+  lambdaHome = Math.min(Math.max(lambdaHome, 0.3), 4);
+  lambdaAway = Math.min(Math.max(lambdaAway, 0.3), 4);
+
+  const MAX_GOALS = 6;
+  let best = { home: 0, away: 0, p: -1 };
+  let pHome = 0, pDraw = 0, pAway = 0;
+
+  for (let h = 0; h <= MAX_GOALS; h++) {
+    for (let a = 0; a <= MAX_GOALS; a++) {
+      const p = poissonP(lambdaHome, h) * poissonP(lambdaAway, a);
+      if (p > best.p) best = { home: h, away: a, p };
+      if (h > a) pHome += p; else if (h === a) pDraw += p; else pAway += p;
+    }
+  }
+
+  return {
+    score:  { home: best.home, away: best.away },
+    prob:   { home: pHome, draw: pDraw, away: pAway },
+    sample: { home: hs.played, away: as.played }
+  };
+}
+
+// Format khối "nhận định" cho 1 trận
+async function fmtPrediction(m) {
+  const home = m.homeTeam?.shortName || m.homeTeam?.name || '?';
+  const away = m.awayTeam?.shortName || m.awayTeam?.name || '?';
+  const pred = await predictMatch(m);
+  const pct  = x => (x * 100).toFixed(0);
+
+  let note = '';
+  if (pred.sample.home === 0 && pred.sample.away === 0) {
+    note = '\n   <i>(Chưa có dữ liệu trận đã đấu tại WC2026, dự đoán theo mức trung bình giải)</i>';
+  }
+
+  return (
+    `🔮 <b>Nhận định</b>\n` +
+    `   Tỉ số dự đoán: <b>${pred.score.home} – ${pred.score.away}</b>\n` +
+    `   ${flag(home)} ${home} thắng: <b>${pct(pred.prob.home)}%</b>` +
+    `  |  Hòa: <b>${pct(pred.prob.draw)}%</b>` +
+    `  |  ${away} thắng ${flag(away)}: <b>${pct(pred.prob.away)}%</b>` +
+    note
+  );
+}
+
 // ─── COMMANDS ─────────────────────────────────────────────────────────────────
 bot.onText(/\/start/, msg => {
   bot.sendMessage(msg.chat.id, `
@@ -194,6 +303,7 @@ Chào mừng! Tôi cung cấp dữ liệu live từ FIFA World Cup 2026.
 /live       – Trận đang diễn ra 🔴
 /results    – Kết quả gần nhất
 /standings  – Bảng xếp hạng
+/dubao      – 🔮 Nhận định & dự đoán tỉ số trận sắp đấu
 /subscribe  – 🔔 Đăng ký thông báo tự động
 /unsubscribe– 🔕 Hủy thông báo
 /help       – Trợ giúp
@@ -278,6 +388,41 @@ bot.onText(/\/standings/, async msg => {
   }
 });
 
+// Dự đoán tỉ số các trận sắp diễn ra (mặc định trong 48h tới, tối đa 8 trận)
+bot.onText(/\/dubao(?:\s+(\d+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const hours  = Math.min(Math.max(parseInt(match[1] || '48', 10) || 48, 1), 168);
+  try {
+    const sending = await bot.sendMessage(chatId, '🔮 Đang phân tích dữ liệu, chờ chút...');
+    const list = await getUpcoming(hours);
+    if (!list.length) {
+      return await bot.editMessageText(`🔮 Không có trận nào trong ${hours}h tới để dự đoán.`, {
+        chat_id: chatId, message_id: sending.message_id
+      });
+    }
+
+    let text = `🔮 <b>Nhận định & dự đoán tỉ số</b>\n<i>(${list.length} trận trong ${hours}h tới)</i>\n`;
+    for (const m of list.slice(0, 8)) {
+      const home  = m.homeTeam?.shortName || m.homeTeam?.name || '?';
+      const away  = m.awayTeam?.shortName || m.awayTeam?.name || '?';
+      const stage = m.stage?.replace(/_/g, ' ') || m.group || '';
+      const block = await fmtPrediction(m);
+      text += `\n${flag(home)} <b>${home}</b> vs <b>${away}</b> ${flag(away)}` +
+              `${stage ? `  <i>[${stage}]</i>` : ''}\n` +
+              `🕐 ${vnTime(m.utcDate)} (giờ VN)\n` +
+              `${block}\n`;
+    }
+    if (list.length > 8) text += `\n<i>… và ${list.length - 8} trận khác. Dùng /dubao ${hours} để lọc khoảng thời gian khác.</i>`;
+    text += `\n<i>⚠ Chỉ mang tính tham khảo, dựa trên thống kê bàn thắng/thua các trận đã đấu tại WC2026.</i>`;
+
+    await bot.editMessageText(text.trim(), {
+      chat_id: chatId, message_id: sending.message_id, parse_mode: 'HTML'
+    });
+  } catch (e) {
+    bot.sendMessage(chatId, `❌ Lỗi: ${e.message}`);
+  }
+});
+
 bot.onText(/\/subscribe/, msg => {
   bot.sendMessage(msg.chat.id, '🔔 <b>Chọn loại thông báo muốn nhận:</b>', {
     parse_mode: 'HTML',
@@ -312,6 +457,7 @@ bot.onText(/\/help/, msg => {
 /live        Đang diễn ra (real-time)
 /results     10 kết quả gần nhất
 /standings   Bảng xếp hạng
+/dubao [giờ] 🔮 Nhận định & dự đoán tỉ số (mặc định 48h tới)
 
 <b>Thông báo tự động:</b>
 /subscribe   Đăng ký push notification
@@ -320,6 +466,7 @@ bot.onText(/\/help/, msg => {
 <b>Thông tin kỹ thuật:</b>
 • API: football-data.org (free)
 • Tường thuật: cập nhật mỗi 2 phút
+• Dự đoán: mô hình Poisson dựa trên thống kê bàn thắng/thua tại WC2026
 • Múi giờ: UTC+7 (Việt Nam)
 • Giải: 11/6 – 19/7/2026
   `.trim(), { parse_mode: 'HTML' });
@@ -350,7 +497,7 @@ bot.on('callback_query', q => {
 
 // ─── SCHEDULED JOBS ───────────────────────────────────────────────────────────
 
-// Job 1: Mỗi 30 phút – kiểm tra trận trong 60 phút tới → thông báo lịch
+// Job 1: Mỗi 30 phút – kiểm tra trận trong 60 phút tới → thông báo lịch + nhận định
 schedule.scheduleJob('*/30 * * * *', async () => {
   if (!subscribers.schedule.length) return;
   try {
@@ -359,8 +506,10 @@ schedule.scheduleJob('*/30 * * * *', async () => {
       const home  = m.homeTeam?.shortName || m.homeTeam?.name || '?';
       const away  = m.awayTeam?.shortName || m.awayTeam?.name || '?';
       const stage = m.stage?.replace(/_/g,' ') || m.group || '';
+      let predBlock = '';
+      try { predBlock = `\n\n${await fmtPrediction(m)}`; } catch (_) {}
       broadcast('schedule',
-        `⏰ <b>Trận sắp bắt đầu!</b>\n\n${flag(home)} ${home} vs ${away} ${flag(away)}\n🕐 ${vnTime(m.utcDate)} (giờ VN)${stage?`\n📌 ${stage}`:''}\n\n→ /live để theo dõi`
+        `⏰ <b>Trận sắp bắt đầu!</b>\n\n${flag(home)} ${home} vs ${away} ${flag(away)}\n🕐 ${vnTime(m.utcDate)} (giờ VN)${stage?`\n📌 ${stage}`:''}${predBlock}\n\n→ /live để theo dõi`
       );
     }
   } catch (_) {}
