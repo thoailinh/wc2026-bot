@@ -149,6 +149,10 @@ async function getLiveMatches() {
 }
 
 // Trận sắp diễn ra (giờ tới)
+// FIX: tương tự getLiveMatches() — 'TIMED' KHÔNG còn là status hợp lệ trong
+// football-data.org API v4 (đây là status cũ của v2, đã bị loại bỏ). Gửi
+// 'SCHEDULED,TIMED' sẽ bị API trả 400 Bad Request. Mọi trận chưa diễn ra ở v4
+// đều có status 'SCHEDULED', nên chỉ cần dùng giá trị này.
 async function getUpcoming(hours = 24) {
   const now = new Date();
   const end = new Date(now.getTime() + hours * 3600 * 1000);
@@ -156,7 +160,7 @@ async function getUpcoming(hours = 24) {
     season: WC_SEASON,
     dateFrom: now.toISOString().slice(0, 10),
     dateTo:   end.toISOString().slice(0, 10),
-    status:   'SCHEDULED,TIMED'
+    status:   'SCHEDULED'
   });
   const matches = (data.matches || []).filter(m => {
     const t = new Date(m.utcDate).getTime();
